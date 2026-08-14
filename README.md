@@ -1,12 +1,13 @@
 # overlap_optimize
 
-**通信与计算重叠** 的最小实现，覆盖三类常见模式：
+**通信与计算重叠** 的最小实现，覆盖四类常见模式：
 
 1. **MoE forward**：`LocalFFN` 之后对 `head_dim` 做 `all_gather`，与下一段计算流水重叠
 2. **DDP backward**：参数梯度就绪后立刻 `async all_reduce`，与更浅层的 backward 重叠
 3. **CUDA D2H**：GPU 算下一块的同时，copy engine 把上一块拷回 pinned host
+4. **CUDA H2D**：DataLoader 把下一批 `to(device)` 的同时，default stream 做当前批 forward
 
-集合通信用 `torch.distributed.*(..., async_op=True)` + `handle.wait()`；D2H 用 CUDA `Stream` / `Event` + `copy_(..., non_blocking=True)`。
+集合通信用 `torch.distributed.*(..., async_op=True)` + `handle.wait()`；PCIe 拷贝用 CUDA `Stream` / `Event` + `non_blocking=True`。
 
 ---
 
@@ -21,6 +22,8 @@ overlap_optimize/
 │   └── README.md
 └── cuda_stream_overlap/
     ├── d2h_overlap.py              # CUDA stream：GPU 计算 ∥ D2H
+    ├── h2d_overlap.py              # CUDA stream：DataLoader H2D ∥ forward（Prefetcher）
+    ├── h2d_overlap_loop.py         # 同上，普通 for + prev-handle
     └── README.md
 ```
 
@@ -29,10 +32,10 @@ overlap_optimize/
 ## 环境
 
 - Python 3.10+
-- PyTorch（集合通信需 `torch.distributed`；D2H 重叠需 CUDA 版 PyTorch + NVIDIA GPU）
+- PyTorch（集合通信需 `torch.distributed`；D2H / H2D 重叠需 CUDA 版 PyTorch + NVIDIA GPU）
 - 集合通信逻辑检查：CPU + `gloo` 即可
 - 集合通信真实重叠：多卡 GPU + `nccl`
-- D2H 重叠：单卡 GPU 即可；host buffer 必须 `pin_memory=True`
+- D2H / H2D 重叠：单卡 GPU 即可；host buffer 必须 `pin_memory=True`
 
 仓库里已有 `.venv` 时：
 
@@ -271,3 +274,24 @@ python -m cuda_stream_overlap.d2h_overlap
 ```
 
 脚本会对比 sync / overlap 的 host 输出，并打印耗时。FFN 时间与 D2H 时间接近时加速最明显，可用 `--n-chunks`、`--n-layers`、`--batch` 调节。
+
+---
+
+## 4. CUDA stream：DataLoader H2D 与 forward 重叠
+
+实现见 [`cuda_stream_overlap/h2d_overlap_loop.py`](cuda_stream_overlap/h2d_overlap_loop.py)（普通 `for`）。Prefetcher 封装在 [`h2d_overlap.py`](cuda_stream_overlap/h2d_overlap.py)。
+
+朴素路径：`x.to(device)` 阻塞后再 `model(x)`。重叠路径：copy stream 发当前批 H2D，default stream 等 **上一批** 到齐再 forward。
+
+```text
+copy:    [H2D0][H2D1][H2D2]
+default:       [Fwd0][Fwd1][Fwd2]
+                    ↑
+              Fwd0 ∥ H2D1
+```
+
+要点：`DataLoader(pin_memory=True)`、`.to(device, non_blocking=True)`、forward 前 `wait_event(上一批 H2D)`（不要 `wait_stream` 整条 copy 流），以及 `record_stream`。
+
+```bash
+python -m cuda_stream_overlap.h2d_overlap_loop
+```

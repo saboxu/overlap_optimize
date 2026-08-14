@@ -1,1 +1,1 @@
-"""CUDA stream overlap of GPU compute and D2H copies."""
+"""CUDA stream overlap of GPU compute with D2H / H2D copies."""
