@@ -17,7 +17,7 @@ overlap_optimize/
     ├── moe_forward.py              # MoE all_gather 同步版 / 异步流水版
     ├── grad_allreduce_overlap.py   # 梯度 all_reduce 与 backward 重叠
     ├── test_grad_allreduce.py      # DDP wrapper 冒烟测试
-    └── README.md                   # 面试向复盘（默写 / 口述）
+    └── README.md                   # 模块说明
 ```
 
 ---
@@ -46,7 +46,7 @@ export PYTHONPATH=.
 
 ## 1. MoE all_gather 重叠
 
-### 题面
+### 输入与计算流程
 
 每张卡本地输入：
 
@@ -128,16 +128,14 @@ prev_handle.wait()                                # 收尾最后一段
 outs.append(shared_ffn(torch.cat(prev_list, dim=-1)))
 ```
 
-### 怎么写（默写步骤）
+### 实现步骤
 
 1. **先写 sync**：`Local → blocking all_gather → Shared`，保证 shape 对
 2. **找气泡里能塞什么**：`Local_{i+1}`、`Shared_{i-1}`（不依赖当前 AG）
 3. **套 prev 模板**：发当前 AG → wait prev → Shared(prev) → 当前变 prev → 最后收尾
 4. **展开 2～3 轮验依赖**：没有对未 wait 的 buffer 做 Shared；最后一段有 wait
 
-口诀：
-
-> 先 chunk；每段 Local → async gather → wait **上一段** 做 Shared → 当前变 prev；最后再 wait 一次。
+要点：先 chunk；每段 Local → async gather → wait **上一段** 做 Shared → 当前变 prev；最后再 wait 一次。
 
 ### 怎么分析「有没有重叠」
 
@@ -212,12 +210,3 @@ torchrun --standalone --nproc_per_node=2 -m communicate_overlap.test_grad_allred
 ```
 
 会检查各 rank 同步后的梯度是否一致，以及 `no_sync` 累积路径。
-
----
-
-## 面试口述（30 秒）
-
-输入是 `[B, E, D_local]`，LocalFFN 后对 head_dim 做 all_gather，再按 expert chunk 过 SharedFFN。  
-优化是把 E 先切开，每段 async all_gather，用下一段 LocalFFN 和上一段 SharedFFN 填通信气泡；用 gather 结果前必须 `handle.wait()`。
-
-梯度侧同理：本层 grad 就绪就 async all_reduce，和更浅层 backward 重叠，step 前再 wait。

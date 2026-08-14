@@ -2,7 +2,7 @@
 
 MoE `all_gather` 与 DDP 梯度 `all_reduce` 的通信计算重叠实现。
 
-完整说明、运行方式和面试复盘见仓库根目录 [README.md](../README.md)。
+完整说明和运行方式见仓库根目录 [README.md](../README.md)。
 
 | 文件 | 内容 |
 |------|------|
