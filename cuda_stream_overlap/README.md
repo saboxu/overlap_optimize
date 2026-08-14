@@ -332,6 +332,7 @@ for x_cpu, y_cpu in loader:
     if prev_x is not None:
         default.wait_event(prev_done)     # 只等上一批，不等当前刚发出的 H2D
         prev_x.record_stream(default)
+        prev_y.record_stream(default)
         pred = model(prev_x)              # Fwd_{i-1} ∥ H2D_i
     prev_x, prev_y, prev_done = x, y, done
 
