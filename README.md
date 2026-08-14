@@ -1,11 +1,12 @@
 # overlap_optimize
 
-分布式训练里 **通信与计算重叠** 的最小实现，覆盖两类常见模式：
+**通信与计算重叠** 的最小实现，覆盖三类常见模式：
 
 1. **MoE forward**：`LocalFFN` 之后对 `head_dim` 做 `all_gather`，与下一段计算流水重叠
 2. **DDP backward**：参数梯度就绪后立刻 `async all_reduce`，与更浅层的 backward 重叠
+3. **CUDA D2H**：GPU 算下一块的同时，copy engine 把上一块拷回 pinned host
 
-核心手段都是 `torch.distributed.*(..., async_op=True)` + 在使用结果前 `handle.wait()`。
+集合通信用 `torch.distributed.*(..., async_op=True)` + `handle.wait()`；D2H 用 CUDA `Stream` / `Event` + `copy_(..., non_blocking=True)`。
 
 ---
 
@@ -13,11 +14,14 @@
 
 ```text
 overlap_optimize/
-└── communicate_overlap/
-    ├── moe_forward.py              # MoE all_gather 同步版 / 异步流水版
-    ├── grad_allreduce_overlap.py   # 梯度 all_reduce 与 backward 重叠
-    ├── test_grad_allreduce.py      # DDP wrapper 冒烟测试
-    └── README.md                   # 模块说明
+├── communicate_overlap/
+│   ├── moe_forward.py              # MoE all_gather 同步版 / 异步流水版
+│   ├── grad_allreduce_overlap.py   # 梯度 all_reduce 与 backward 重叠
+│   ├── test_grad_allreduce.py      # DDP wrapper 冒烟测试
+│   └── README.md
+└── cuda_stream_overlap/
+    ├── d2h_overlap.py              # CUDA stream：GPU 计算 ∥ D2H
+    └── README.md
 ```
 
 ---
@@ -25,9 +29,10 @@ overlap_optimize/
 ## 环境
 
 - Python 3.10+
-- PyTorch（需 `torch.distributed`）
-- 逻辑正确性：CPU + `gloo` 即可
-- 真实通信重叠：多卡 GPU + `nccl`
+- PyTorch（集合通信需 `torch.distributed`；D2H 重叠需 CUDA 版 PyTorch + NVIDIA GPU）
+- 集合通信逻辑检查：CPU + `gloo` 即可
+- 集合通信真实重叠：多卡 GPU + `nccl`
+- D2H 重叠：单卡 GPU 即可；host buffer 必须 `pin_memory=True`
 
 仓库里已有 `.venv` 时：
 
@@ -196,12 +201,12 @@ optimizer.step()
 
 ### 和 MoE 模板对比
 
-| | MoE all_gather | DDP all_reduce |
-|--|----------------|----------------|
-| 通信前计算 | LocalFFN | 本层 backward 产出 grad |
-| 异步通信 | `all_gather(async)` | `all_reduce(grad, async)` |
-| 中间 wait prev？ | **需要**（Shared 马上用） | **通常不需要**（step 才用） |
-| 收尾 wait | 最后一段 Shared 前 | `synchronize()` / `optimizer.step()` 前 |
+| | MoE all_gather | DDP all_reduce | CUDA D2H |
+|--|----------------|----------------|----------|
+| 通信前计算 | LocalFFN | 本层 backward 产出 grad | 本 chunk FFN |
+| 异步通信 | `all_gather(async)` | `all_reduce(grad, async)` | `copy_(non_blocking=True)` |
+| 中间 wait prev？ | **需要**（Shared 马上用） | **通常不需要**（step 才用） | Event 等的是 **当前块** FFN，不是 prev |
+| 收尾 wait | 最后一段 Shared 前 | `synchronize()` / `optimizer.step()` 前 | 读 host 前 `cuda.synchronize()` |
 
 ### 运行测试
 
@@ -210,3 +215,59 @@ torchrun --standalone --nproc_per_node=2 -m communicate_overlap.test_grad_allred
 ```
 
 会检查各 rank 同步后的梯度是否一致，以及 `no_sync` 累积路径。
+
+---
+
+## 3. CUDA stream：计算与 D2H 重叠
+
+实现见 [`cuda_stream_overlap/d2h_overlap.py`](cuda_stream_overlap/d2h_overlap.py)。
+
+把输入 `[N, D]` 沿 batch 切成若干 chunk。每块先在 GPU 上过 FFN，再拷回 CPU。
+
+朴素路径（默认流，串行）：
+
+```text
+[FFN0][====D2H0====][FFN1][====D2H1====][FFN2][====D2H2====]
+```
+
+重叠路径（default stream 算 FFN，另开 copy stream 做 D2H）：
+
+```text
+default: [FFN0][FFN1][FFN2]
+copy:          [====D2H0====][====D2H1====][====D2H2====]
+                    ↑
+              FFN1 ∥ D2H0
+```
+
+| 约束 | 原因 |
+|------|------|
+| `host_out` 必须 pinned | 只有页锁定内存才能异步 DMA；普通 `.cpu()` 会变成同步拷贝 |
+| D2H 不要放回 default stream | 和 FFN 同一条流就会串行；copy 必须是 side stream |
+| `torch.cuda.Stream()` 必须是 non-blocking | 这样 default 上的下一块 FFN 不会隐式等 D2H |
+| `copy_stream.wait_event(FFN_i)` | 不能拷尚未写完的 device 输出 |
+| 收尾 `copy_stream.synchronize()` | 读 host 结果前必须等 DMA 完成 |
+| 暂存 `y_i` 直到拷贝结束 | 否则 device buffer 可能被释放或复用 |
+
+```python
+copy_stream = torch.cuda.Stream()
+
+for lo, hi in ranges:
+    y_i = module(x[lo:hi]).contiguous()
+    done = torch.cuda.Event()
+    done.record()
+    device_hold.append(y_i)
+
+    with torch.cuda.stream(copy_stream):
+        copy_stream.wait_event(done)
+        host_out[lo:hi].copy_(y_i, non_blocking=True)
+
+copy_stream.synchronize()
+```
+
+### 运行
+
+```bash
+python -m cuda_stream_overlap.d2h_overlap
+```
+
+脚本会对比 sync / overlap 的 host 输出，并打印耗时。FFN 时间与 D2H 时间接近时加速最明显，可用 `--n-chunks`、`--n-layers`、`--batch` 调节。
